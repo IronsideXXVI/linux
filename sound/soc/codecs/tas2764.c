@@ -118,6 +118,8 @@ struct tas2764_priv {
 /* LTCH0 faults that shut the whole SDZ group down: over temperature, over current */
 #define TAS2764_INT_LTCH0_GROUP_FAULTS	(BIT(0) | BIT(1))
 #define TAS2764_INT_LTCH0_TDM_CLOCK	BIT(2)
+/* The mask bit of the same source in INT_MASK0 */
+#define TAS2764_INT_MASK0_TDM_CLOCK	BIT(2)
 
 /*
  * With apple,deferred-shutdown, how long after a stream's end the muted amp
@@ -1141,7 +1143,17 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 	tas2764->idle_slot_config.tx_mode = SND_SOC_DAI_TDM_IDLE_NONE;
 
 	if (tas2764->irq) {
-		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK0, 0x00);
+		/*
+		 * ASoC unmutes the amplifier before the CPU DAI starts the bus
+		 * clock, and with the shutdown dance's immediate SDZ it latches a
+		 * TDM clock error at every stream start (and can latch it again
+		 * once cleared while the clock is still stopped). macOS, which
+		 * does the dance, leaves the interrupt masks at reset, where that
+		 * error is masked: keep it masked on those amplifiers too.
+		 */
+		ret = snd_soc_component_write(tas2764->component, TAS2764_INT_MASK0,
+					      tas2764_shutdown_dance(tas2764) ?
+					      TAS2764_INT_MASK0_TDM_CLOCK : 0x00);
 		if (ret < 0)
 			goto err_sdz;
 
