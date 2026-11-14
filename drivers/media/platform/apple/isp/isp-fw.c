@@ -11,6 +11,7 @@
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
+#include <linux/moduleparam.h>
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/sleep.h>
@@ -23,6 +24,15 @@
 #include "isp-iommu.h"
 #include "isp-ipc.h"
 #include "isp-regs.h"
+
+/*
+ * macOS powers the T8132 ISP down without writing the coprocessor control
+ * word 0. macos_stop=N writes it again, as before.
+ */
+static bool macos_stop = true;
+module_param(macos_stop, bool, 0644);
+MODULE_PARM_DESC(macos_stop,
+		 "Power the ISP down as macOS does where known, e.g. T8132: leave the control word alone (default: on)");
 #include "isp-v4l2.h"
 
 #define ISP_FIRMWARE_POLL_US	  1000
@@ -356,7 +366,11 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
 	u32 control = isp_coproc_read32(isp, isp_coproc_control(isp));
 	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
 
-	if (control) {
+	/*
+	 * A macOS-style power-down leaves the start word (0x10) where the
+	 * domain kept it; the boot writes 0 then 0x10 as for a fresh start.
+	 */
+	if (control && !(isp->macos_stopped && control == 0x10)) {
 		isp_err(isp, "coprocessor already started (control 0x%x)\n",
 			control);
 		return -EBUSY;
@@ -477,6 +491,7 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 	/* Only a coprocessor that was started has to settle and quiesce */
 	bool started = isp->hw->coproc_quiesce &&
 		       isp_coproc_read32(isp, isp_coproc_control(isp));
+	bool macos = READ_ONCE(macos_stop) && isp->hw->macos_stop;
 	u32 val;
 
 	/* A coprocessor that powered down waits in WFI */
@@ -491,7 +506,7 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 	 * engine's own restore of the ISP in a wake that kept DRAM up depends on it:
 	 * with the bit cleared that wake stalls until the SoC's watchdog resets it.
 	 */
-	if (isp->hw->gen != ISP_GEN_T8140)
+	if (isp->hw->gen != ISP_GEN_T8140 && !macos)
 		isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	if (started) {
@@ -503,6 +518,7 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 	}
 
 	apple_isp_power_down_domains(isp);
+	isp->macos_stopped = macos;
 }
 
 static int isp_firmware_boot_stage1(struct apple_isp *isp)

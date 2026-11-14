@@ -1290,6 +1290,8 @@ static const struct apple_isp_hw apple_isp_hw_t8132 = {
 	.shared_size = 0xdec00000,
 	.fw_restore = true,
 	.deferred_start = true,
+	/* macOS never writes its coprocessor control word 0 at power-down */
+	.macos_stop = true,
 };
 
 /*

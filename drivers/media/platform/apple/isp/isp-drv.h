@@ -277,6 +277,9 @@ struct apple_isp_hw {
 	 * reopen the camera, does not wait for another firmware start.
 	 */
 	unsigned int fw_idle_ms;
+
+	/* Power down as macOS does: the coprocessor control word is left as it is */
+	bool macos_stop;
 };
 
 enum isp_sensor_id {
@@ -503,6 +506,8 @@ struct apple_isp {
 	 * resident firmware cannot be started again before the next boot.
 	 */
 	bool ipc_failed;
+	/* The last power-down left the coprocessor control word as it was */
+	bool macos_stopped;
 };
 
 struct isp_chan_ops {
