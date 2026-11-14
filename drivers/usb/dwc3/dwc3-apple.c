@@ -178,6 +178,8 @@ struct dwc3_apple {
 	bool rpm_held;
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
+	enum usb_device_speed dt_maximum_speed;
+	bool dt_speed_saved;
 	bool sleep_ddr;
 	struct notifier_block pm_nb;
 	/* Kept through a deep sleep, with the PHY's hibernation, and the GUID it had. */
@@ -863,6 +865,52 @@ static bool dwc3_apple_host_only(struct device *dev)
 	       of_device_is_compatible(dev->of_node, "apple,t6050-dwc3");
 }
 
+static bool t8132_usb_gen2 = true;
+module_param(t8132_usb_gen2, bool, 0644);
+MODULE_PARM_DESC(t8132_usb_gen2,
+		 "T8132: let a Type-C port's USB 3.1 controller run SuperSpeed Plus (USB 3.2 Gen 2, 10 Gb/s), as macOS's \"USB 3.1 Bus\" does; applies at the next cable (default on)");
+
+/*
+ * The T8132 ports' controllers are DWC_usb31 cores, and macOS names their buses "USB 3.1 Bus".
+ * The devicetree caps them at maximum-speed = "super-speed", for which dwc3_core_init() sets
+ * LLUCTL.FORCE_GEN1 and the link never tries 10 Gb/s. With t8132_usb_gen2, a cable session
+ * starts with the cap lifted, as Aurora's J575c (T6041) runs its ports with no maximum-speed:
+ * SuperSpeed Plus, one lane at Gen 2. It is on by default, so that a 10 Gb/s device gets 10 Gb/s
+ * as under macOS; a link that does not train at Gen 2 falls back as any SuperSpeed link does.
+ * Cleared, the next cable session is capped as the devicetree says again.
+ */
+static void dwc3_apple_usb_gen2(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	bool gen2;
+	u32 reg;
+	int i;
+
+	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
+	    !DWC3_IP_IS(DWC31))
+		return;
+	if (!appledwc->dt_speed_saved) {
+		appledwc->dt_maximum_speed = dwc->maximum_speed;
+		appledwc->dt_speed_saved = true;
+	}
+	if (appledwc->dt_maximum_speed != USB_SPEED_SUPER)
+		return;
+
+	gen2 = READ_ONCE(t8132_usb_gen2);
+	dwc->maximum_speed = gen2 ? USB_SPEED_SUPER_PLUS : USB_SPEED_SUPER;
+	dwc->max_ssp_rate = gen2 ? USB_SSP_GEN_2x1 : USB_SSP_GEN_UNKNOWN;
+	for (i = 0; i < dwc->num_usb3_ports; i++) {
+		reg = dwc3_readl(dwc, DWC3_LLUCTL(i));
+		if (gen2)
+			reg &= ~DWC3_LLUCTL_FORCE_GEN1;
+		else
+			reg |= DWC3_LLUCTL_FORCE_GEN1;
+		dwc3_writel(dwc, DWC3_LLUCTL(i), reg);
+	}
+	if (gen2)
+		dev_info(appledwc->dev, "SuperSpeed Plus (Gen 2) allowed for this cable session\n");
+}
+
 static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
 {
 	int ret, ret_reset;
@@ -880,6 +928,7 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	ret = dwc3_apple_core_start(appledwc, state);
 	if (ret)
 		return ret;
+	dwc3_apple_usb_gen2(appledwc);
 
 	ret = dwc3_apple_set_role(appledwc, state);
 	if (ret)
