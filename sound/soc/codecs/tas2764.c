@@ -7,6 +7,7 @@
 #include <linux/moduleparam.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/ktime.h>
 #include <linux/delay.h>
 #include <linux/hwmon.h>
 #include <linux/pm.h>
@@ -92,6 +93,8 @@ struct tas2764_priv {
 	bool deferred_shutdown;
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
 	bool stream_stopped;
+	/* When the amp was last unmuted for a stream; 0 before the first */
+	ktime_t unmute_time;
 	struct delayed_work shutdown_work;
 	/*
 	 * Orders the fault handler's read and judgement of the latches against
@@ -121,6 +124,14 @@ struct tas2764_priv {
  * margin over that.
  */
 #define TAS2764_DEFERRED_SHUTDOWN_MS	150
+
+/*
+ * ASoC unmutes a codec in prepare, before the CPU DAI starts the bus clock
+ * at trigger, so an amp powered for a stream latches a clock fault at the
+ * start of that stream. A lone clock latch this soon after an unmute is that
+ * one. (macOS's driver never reads the latch at a stream's start.)
+ */
+#define TAS2764_START_CLOCK_GRACE_MS	100
 
 static bool tas2764_group_failed(struct tas2764_priv *tas2764)
 {
@@ -236,6 +247,7 @@ static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
 {
 	u8 latched[6] = {0, 0, 0, 0, 0, 0};
 	unsigned int val;
+	ktime_t start;
 	int ret = IRQ_NONE;
 	int i;
 
@@ -253,6 +265,20 @@ static irqreturn_t tas2764_irq_locked(struct tas2764_priv *tas2764)
 	 * down since, sees the bus clock stop: that is expected, not a fault.
 	 */
 	if (latched[0] == TAS2764_INT_LTCH0_TDM_CLOCK && READ_ONCE(tas2764->stream_stopped)) {
+		snd_soc_component_update_bits(tas2764->component, TAS2764_INT_CLK_CFG,
+					      TAS2764_INT_CLK_CFG_IRQZ_CLR,
+					      TAS2764_INT_CLK_CFG_IRQZ_CLR);
+		return IRQ_HANDLED;
+	}
+
+	/*
+	 * Nor is the clock fault of a stream's own start, latched before the
+	 * bus clock ran. A clock that stays bad latches again once this one is
+	 * cleared, after the grace period, and is reported then.
+	 */
+	start = READ_ONCE(tas2764->unmute_time);
+	if (latched[0] == TAS2764_INT_LTCH0_TDM_CLOCK && start &&
+	    ktime_ms_delta(ktime_get(), start) < TAS2764_START_CLOCK_GRACE_MS) {
 		snd_soc_component_update_bits(tas2764->component, TAS2764_INT_CLK_CFG,
 					      TAS2764_INT_CLK_CFG_IRQZ_CLR,
 					      TAS2764_INT_CLK_CFG_IRQZ_CLR);
@@ -545,6 +571,8 @@ static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 			WRITE_ONCE(tas2764->stream_stopped, false);
 			mutex_unlock(&tas2764->fault_lock);
 		}
+		/* Before the amp powers: the clock fault it latches now is expected */
+		WRITE_ONCE(tas2764->unmute_time, ktime_get());
 		tas2764->dac_powered = true;
 		ret = tas2764_update_pwr_ctrl(tas2764);
 		if (ret)
