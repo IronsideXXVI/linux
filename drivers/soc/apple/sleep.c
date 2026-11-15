@@ -315,6 +315,11 @@ static struct {
 	void *data;
 } apple_sleep_enclave;
 
+static bool apcie_port_clocks = true;
+module_param(apcie_port_clocks, bool, 0644);
+MODULE_PARM_DESC(apcie_port_clocks,
+		 "After a wake, clock back the PCIe ports no host restores, so that their DARTs answer");
+
 /*
  * Written with bits 0 and 63 by every core right before its last WFI, measured
  * from macOS. This is not CYC_OVRD, which is undefined on this SoC.
@@ -635,6 +640,10 @@ struct apple_sleep {
 	bool apcie_port_down;
 	void __iomem *apcie_port;
 	void __iomem *apcie_port_phy;
+	/* Ports no host sets up again after a real sleep: no managed radio contract */
+	bool apcie_ports_unowned;
+	void __iomem *apcie_port2;
+	void __iomem *apcie_port2_phy;
 	void __iomem *apcie_engine;
 	void __iomem *apcie_fabric;
 	struct apple_tunable *apcie_axi_tunable;
@@ -2232,6 +2241,28 @@ static void sleep_apcie_port_stop_once(struct apple_sleep *s)
 	sleep_apcie_port_stop(s);
 }
 
+/*
+ * A port that no host sets up again after a real sleep (one without the managed radio
+ * contract) gets its clocks back as the loader set them at boot: the DART in its unit is
+ * clocked by the port and its resume reads it. PERST# and the link stay as the wake left them.
+ */
+static void sleep_apcie_port_clock(void __iomem *port, void __iomem *phy)
+{
+	u32 val;
+
+	if (!port || !phy)
+		return;
+	writel(readl(port + APCIE_PORT_APPCLK) | APCIE_PORT_APPCLK_EN, port + APCIE_PORT_APPCLK);
+	writel(readl(phy) & ~(APCIE_PHY_CTRL_CLK0REQ | APCIE_PHY_CTRL_CLK1REQ), phy);
+	writel(readl(phy) | APCIE_PHY_CTRL_CLK0REQ, phy);
+	readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, APCIE_POLL_US);
+	writel(readl(phy) | APCIE_PHY_CTRL_CLK1REQ, phy);
+	readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK1ACK, 1, APCIE_POLL_US);
+	writel(readl(phy) & ~APCIE_PHY_CTRL_RESET, phy);
+	writel(readl(phy) | APCIE_PORT_PHY_EN0, phy);
+	writel(readl(phy) | APCIE_PORT_PHY_EN1, phy);
+}
+
 /* A poll here only paces the steps: the power goes next whatever it reads. */
 static void sleep_apcie_phy_off(struct apple_sleep *s)
 {
@@ -3328,6 +3359,11 @@ static void t8132_wake(struct apple_sleep *s)
 
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
+	if (s->pcie_ans_stopped && !s->pcie_ans_on_ret && s->apcie_ports_unowned &&
+	    READ_ONCE(apcie_port_clocks)) {
+		sleep_apcie_port_clock(s->apcie_port, s->apcie_port_phy);
+		sleep_apcie_port_clock(s->apcie_port2, s->apcie_port2_phy);
+	}
 	s->apcie_port_down = true;
 	s->pins_lost = s->pins_saved_valid;
 }
@@ -3972,6 +4008,9 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 
 	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
 	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
+	s->apcie_port2 = apple_sleep_apcie_block(s, np, "port2", NULL, NULL);
+	s->apcie_port2_phy = apple_sleep_apcie_block(s, np, "phy2", NULL, NULL);
+	s->apcie_ports_unowned = !of_property_present(np, "apple,managed-sids");
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
 		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);
