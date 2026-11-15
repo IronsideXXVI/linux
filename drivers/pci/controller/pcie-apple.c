@@ -543,6 +543,8 @@ struct apple_pcie {
 	bool			relink_armed;
 	unsigned int		nrelink_darts;
 	struct device		*relink_dart[4];
+	/* The port each of them sits behind, from its iommu-map RID and the port's bus-range */
+	struct apple_pcie_port	*relink_dart_port[4];
 	struct work_struct	neo_recover_work;
 	bool			neo_recover;
 	/* The link and the functions back after a sleep, while the rest resumes */
@@ -589,8 +591,9 @@ struct apple_pcie_port {
 	struct gpio_desc	*pwren_gpio;
 	int			idx;
 	bool			started;
-	/* Its link was up when a deep sleep began */
+	/* Its link was up when a deep sleep began; clocked again after the wake */
 	bool			relink_up;
+	bool			relink_ok;
 	bool			needs_stop;
 	bool			link_failed;
 	bool			irq_disabled;
@@ -5861,6 +5864,18 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
  * endpoints keep their power (the radio's rail is the SMC's) and the PCI core restores
  * their configuration after this. A refusal leaves the links as they were.
  */
+/* The port whose bus-range starts at @bus: the one a RID on that bus comes through. */
+static struct apple_pcie_port *apple_pcie_relink_port_of(struct apple_pcie *pcie, u32 bus)
+{
+	struct apple_pcie_port *port;
+	u32 start;
+
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (!of_property_read_u32_index(port->np, "bus-range", 0, &start) && start == bus)
+			return port;
+	return NULL;
+}
+
 static void apple_pcie_relink_probe(struct apple_pcie *pcie)
 {
 	struct device *dev = pcie->dev;
@@ -5903,6 +5918,8 @@ static void apple_pcie_relink_probe(struct apple_pcie *pcie)
 			break;
 		}
 		/* The reference is kept: this host can't be unbound. */
+		pcie->relink_dart_port[pcie->nrelink_darts] =
+			apple_pcie_relink_port_of(pcie, be32_to_cpup(map + i) >> 8);
 		pcie->relink_dart[pcie->nrelink_darts++] = &pdev->dev;
 	}
 	if (ret || !pcie->nrelink_darts) {
@@ -5932,11 +5949,30 @@ static void apple_pcie_relink_save(struct apple_pcie *pcie)
 	pcie->relink_armed = true;
 }
 
+/*
+ * The commit sets the reference buffer off on the glue it stops and the power-off resets it
+ * there on the other ports; the loader clears it at boot, which probe relies on. Clear it,
+ * then give the port its clock and reference clock: enough for the DART in its unit.
+ */
+static int apple_pcie_relink_clock(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	if (!port->phy)
+		return -ENODEV;
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+	rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+	udelay(1);
+	return apple_pcie_setup_refclk(pcie, port);
+}
+
 static int apple_pcie_relink_port(struct apple_pcie *pcie, struct apple_pcie_port *port)
 {
 	u32 stat;
 	int i, ret;
 
+	if (port->phy) {
+		rmw_clear(PHY_LANE_CFG_REFBUF_OFF, port->phy + PHY_LANE_CFG);
+		udelay(1);
+	}
 	ret = apple_pcie_setup_link(pcie, port, port->np);
 	if (ret)
 		return ret;
@@ -5969,25 +6005,34 @@ static int apple_pcie_relink(struct apple_pcie *pcie)
 
 	pcie->relink_armed = false;
 	if (pm_resume_via_firmware()) {
+		/* A port that was down (an empty reader's) is only clocked, for its DART. */
 		list_for_each_entry(port, &pcie->ports, entry) {
-			if (!port->relink_up)
-				continue;
-			err = apple_pcie_relink_port(pcie, port);
-			if (err) {
+			err = port->relink_up ? apple_pcie_relink_port(pcie, port) :
+						apple_pcie_relink_clock(pcie, port);
+			port->relink_ok = !err;
+			if (err && port->relink_up) {
 				dev_err(pcie->dev, "port %pOF not back after deep sleep: %d\n",
 					port->np, err);
 				WRITE_ONCE(port->link_failed, true);
-				ret = ret ?: err;
 			}
+			if (err)
+				ret = ret ?: err;
 		}
-		/* A DART whose port may not be clocked stays gated: nothing reaches it. */
-		for (i = 0; !ret && i < pcie->nrelink_darts; i++) {
+		/* Each DART whose own port is clocked again; another stays gated, unread. */
+		for (i = 0; i < pcie->nrelink_darts; i++) {
+			port = pcie->relink_dart_port[i];
+			if (!port || !port->relink_ok) {
+				dev_err(pcie->dev, "%s stays gated: its port is not back\n",
+					dev_name(pcie->relink_dart[i]));
+				continue;
+			}
 			err = apple_dart_host_resume(pcie->relink_dart[i]);
 			if (err)
-				ret = err;
+				ret = ret ?: err;
 		}
-		if (!ret)
-			apple_sleep_radio_port_up();
+		list_for_each_entry(port, &pcie->ports, entry)
+			if (!port->idx && port->relink_ok && port->relink_up)
+				apple_sleep_radio_port_up();
 	}
 	list_for_each_entry(port, &pcie->ports, entry)
 		if (!READ_ONCE(port->link_failed))
