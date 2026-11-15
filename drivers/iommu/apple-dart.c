@@ -6527,6 +6527,16 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	return ret;
 }
 
+/*
+ * Off: after a real sleep, a DART runtime PM had suspended is left to its runtime resume, which
+ * restores it before its next user, instead of being written in noirq while the block its
+ * host sets up (a port clock, a coprocessor) may not answer yet. On: as before.
+ */
+static bool wake_restore_suspended = true;
+module_param(wake_restore_suspended, bool, 0644);
+MODULE_PARM_DESC(wake_restore_suspended,
+		 "After a real sleep, restore runtime-suspended DARTs in noirq (default) or at their runtime resume");
+
 static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
@@ -6556,7 +6566,7 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 	 * starting its firmware, and this would land on top.
 	 */
 	if (!ret && pm_resume_via_firmware() && pm_runtime_status_suspended(dev) &&
-	    !dart->sleep_restore.count) {
+	    !dart->sleep_restore.count && READ_ONCE(wake_restore_suspended)) {
 		ret = apple_dart_resume(dev);
 		if (ret)
 			dev_err(dev, "restore after sleep failed: %d\n", ret);
