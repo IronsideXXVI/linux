@@ -179,6 +179,9 @@ static const struct attribute_group apple_pmp_dram_group = {
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030;
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132;
+static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
+				      bool enable, bool no_ack);
 
 /* T6001 AGX request (see the engine below set_state): AGX is soc-device record 9 on the T6001. */
 #define APPLE_PMP_T6001_AGX_ID 9
@@ -2272,6 +2275,38 @@ static int apple_pmp_report_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmp_report_pm_ops, apple_pmp_report_suspend,
 				apple_pmp_report_resume);
 
+/*
+ * T8132 GFX power request (default on). macOS 26B123 on the J604 holds PS-REQ
+ * bit 12 for the whole run (hypervisor trace: the request word reads 0x209000
+ * or 0x309000 at all 3 writes in 86 s, GFX, DISP and MSR held, AVD toggling),
+ * and bit 12 is AGX's position in the ADT's soc-device table (device ID 5,
+ * record 12 of 34). Its GPU firmware powers GFX down about ten times a second
+ * at idle; ours, with only the PMP mailbox's AGX request and bit 12 clear,
+ * never does. Hold the bit once the PMP runs, without waiting for an
+ * acknowledgment (macOS never reads it on this SoC). The request shadow keeps
+ * it across a system sleep's wake. 0 leaves bit 12 clear, as before.
+ */
+#define PMP_T8132_GFX_REQUEST_BIT	12
+static bool t8132_gfx_request = true;
+module_param(t8132_gfx_request, bool, 0444);
+MODULE_PARM_DESC(t8132_gfx_request,
+		 "T8132: hold the GFX power request (PS-REQ bit 12) as macOS does (default on)");
+
+static void apple_pmp_report_t8132_gfx_request(struct apple_pmp_report *rep)
+{
+	int ret;
+
+	if (rep->offsets != &apple_pmp_offsets_t8132 || !t8132_gfx_request)
+		return;
+	ret = apple_pmp_report_set_state(rep, PMP_T8132_GFX_REQUEST_BIT, true, true);
+	if (ret)
+		dev_warn(rep->dev, "t8132: GFX power request (PS-REQ bit %d) not held: %d\n",
+			 PMP_T8132_GFX_REQUEST_BIT, ret);
+	else
+		dev_info(rep->dev, "t8132: GFX power request (PS-REQ bit %d) held as macOS\n",
+			 PMP_T8132_GFX_REQUEST_BIT);
+}
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2362,6 +2397,11 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (rep->defer)
 		queue_delayed_work(system_freezable_power_efficient_wq,
 				   &rep->ready_work, 0);
+
+	if (!rep->defer && apple_pmp_report_running(rep))
+		apple_pmp_report_t8132_gfx_request(rep);
+	else if (t8132_gfx_request && rep->offsets == &apple_pmp_offsets_t8132)
+		dev_warn(dev, "t8132: PMP not running at probe, GFX power request not held\n");
 
 	return 0;
 }
