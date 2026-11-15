@@ -51,7 +51,9 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/of_pci.h>
 #include <linux/of_platform.h>
+#include <linux/pci.h>
 #include <linux/percpu.h>
 #include <linux/sched/task_stack.h>
 #include <asm/sections.h>
@@ -679,6 +681,9 @@ struct apple_sleep {
 	/* The radio port's PERST# among them, or -1 */
 	int radio_perst;
 	bool radio_perst_low;
+	/* The SD card reader port's, or -1 */
+	int sd_perst;
+	bool sd_perst_low;
 	bool returned;
 	/* This wake came back down the deep path, not the DRAM-kept one. */
 	bool deep_ran;
@@ -2182,10 +2187,9 @@ EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut_wake);
  * the link untouched. A link that's down or a radio that's gone only makes the poll time
  * out, and the power goes next either way.
  */
-static void sleep_apcie_port_stop(struct apple_sleep *s)
+static void sleep_apcie_port_stop(struct apple_sleep *s, void __iomem *port,
+				  void __iomem *phy, int perst, bool perst_low, bool radio)
 {
-	void __iomem *port = s->apcie_port;
-	void __iomem *phy = s->apcie_port_phy;
 	u32 val;
 
 	writel(readl(port + APCIE_PORT_INTMSK) | APCIE_PORT_INT_LINK, port + APCIE_PORT_INTMSK);
@@ -2198,16 +2202,16 @@ static void sleep_apcie_port_stop(struct apple_sleep *s)
 		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
 					  10, APCIE_PORT_STOP_US);
 	}
-	/* The radio keeps its power and firmware, in reset until its host releases it. */
-	if (s->radio_perst >= 0 && sleep_ps_on(s, s->soc->ps.gpio)) {
-		void __iomem *reg = s->pins + PIN_REG(s->radio_perst);
+	/* The endpoint keeps its power, in reset until its host releases it. */
+	if (perst >= 0 && sleep_ps_on(s, s->soc->ps.gpio)) {
+		void __iomem *reg = s->pins + PIN_REG(perst);
 
 		val = readl(reg);
-		writel(s->radio_perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
+		writel(perst_low ? val & ~PIN_DATA : val | PIN_DATA, reg);
 	}
 	writel(readl(phy) & ~APCIE_PORT_PHY_LINK, phy);
 
-	if (s->apcie_engine && s->apcie_fabric) {
+	if (radio && s->apcie_engine && s->apcie_fabric) {
 		writel(0, s->apcie_engine + APCIE_ENGINE_IRQ_MASK);
 		writel(3, s->apcie_fabric + APCIE_FABRIC_STOP);
 		writel(readl(s->apcie_engine + APCIE_ENGINE_CTRL) | APCIE_ENGINE_STOP,
@@ -2231,14 +2235,35 @@ static void sleep_apcie_port_stop(struct apple_sleep *s)
 	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
 }
 
+/*
+ * The SD card reader on port 2, stopped as the radio's port is, so that the block's power
+ * doesn't go with its link up while the reader's own rail stays on. Its host trains it again
+ * after the wake. A port with its link down (the slot empty, the reader powered down by its
+ * host) or never clocked is left as it is: the power going takes nothing from it.
+ */
+static void sleep_apcie_port2_stop(struct apple_sleep *s)
+{
+	void __iomem *port = s->apcie_port2;
+
+	if (!port || !s->apcie_port2_phy ||
+	    !(readl(port + APCIE_PORT_APPCLK) & APCIE_PORT_APPCLK_EN) ||
+	    !(readl(port + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP))
+		return;
+	sleep_apcie_port_stop(s, port, s->apcie_port2_phy, s->sd_perst, s->sd_perst_low, false);
+}
+
 static void sleep_apcie_port_stop_once(struct apple_sleep *s)
 {
+	if (s->apcie_port_stopped || !sleep_ps_on(s, s->soc->ps.apcie_gp) ||
+	    !sleep_ps_on(s, s->soc->ps.apcie_phy_sw))
+		return;
+	sleep_apcie_port2_stop(s);
 	/* Only with the port set up, by the loader or by its host after a wake, or it aborts. */
-	if (s->apcie_port_stopped || s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy ||
-	    !sleep_ps_on(s, s->soc->ps.apcie_gp) || !sleep_ps_on(s, s->soc->ps.apcie_phy_sw))
+	if (s->apcie_port_down || !s->apcie_port || !s->apcie_port_phy)
 		return;
 	s->apcie_port_stopped = true;
-	sleep_apcie_port_stop(s);
+	sleep_apcie_port_stop(s, s->apcie_port, s->apcie_port_phy, s->radio_perst,
+			      s->radio_perst_low, true);
 }
 
 /*
@@ -4020,11 +4045,16 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 	of_node_put(np);
 }
 
-/* The radio port's PERST# on the AP pins @np, from the ports of the SoC's enabled PCIe host. */
+/*
+ * The radio port's (device 0) and the SD card reader port's (device 2) PERST# on the AP pins
+ * @np, each from its own port node of the SoC's enabled PCIe host. A port without the line
+ * (the J604's radio, released by the port's own PERST register) has none.
+ */
 static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_node *np)
 {
 	struct device_node *host, *port;
 	struct of_phandle_args args;
+	int devfn;
 
 	host = of_parse_phandle(s->dev->of_node, "apple,apcie", 0);
 	if (!host)
@@ -4034,10 +4064,16 @@ static void apple_sleep_find_radio_perst(struct apple_sleep *s, struct device_no
 			if (of_parse_phandle_with_args(port, "reset-gpios", "#gpio-cells", 0,
 						       &args))
 				continue;
+			devfn = of_pci_get_devfn(port);
 			if (args.np == np && args.args_count >= 2 && args.args[0] < s->npins &&
-			    !test_bit(args.args[0], s->pins_skip)) {
-				s->radio_perst = args.args[0];
-				s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
+			    !test_bit(args.args[0], s->pins_skip) && devfn >= 0) {
+				if (PCI_SLOT(devfn) == 0) {
+					s->radio_perst = args.args[0];
+					s->radio_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
+				} else if (PCI_SLOT(devfn) == 2) {
+					s->sd_perst = args.args[0];
+					s->sd_perst_low = args.args[1] & GPIO_ACTIVE_LOW;
+				}
 			}
 			of_node_put(args.np);
 		}
@@ -4053,6 +4089,7 @@ static void apple_sleep_map_pins(struct apple_sleep *s)
 	int i, n;
 
 	s->radio_perst = -1;
+	s->sd_perst = -1;
 	if (!np)
 		return;
 	if (!of_device_is_available(np) || of_property_read_u32(np, "apple,npins", &npins) ||
