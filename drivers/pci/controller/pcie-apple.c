@@ -538,6 +538,11 @@ struct apple_pcie {
 	struct apple_pcie_neo_cold *neo_cold;
 	struct notifier_block	neo_pm_nb;
 	bool			neo_sleep_armed;
+	/* Unmanaged T8132 host (J604): its ports and DARTs brought back after a deep sleep */
+	bool			relink;
+	bool			relink_armed;
+	unsigned int		nrelink_darts;
+	struct device		*relink_dart[4];
 	struct work_struct	neo_recover_work;
 	bool			neo_recover;
 	/* The link and the functions back after a sleep, while the rest resumes */
@@ -584,6 +589,8 @@ struct apple_pcie_port {
 	struct gpio_desc	*pwren_gpio;
 	int			idx;
 	bool			started;
+	/* Its link was up when a deep sleep began */
+	bool			relink_up;
 	bool			needs_stop;
 	bool			link_failed;
 	bool			irq_disabled;
@@ -601,6 +608,7 @@ static void __noreturn apple_radio_terminal(void);
 static int apple_pcie_managed_admit(struct apple_pcie_port *port);
 static struct apple_pcie *apple_pcie_lookup(struct device *dev);
 static int apple_pcie_radio_check_cold(struct apple_pcie_port *port);
+static void apple_pcie_relink_probe(struct apple_pcie *pcie);
 
 static void rmw_set(u32 set, void __iomem *addr)
 {
@@ -5079,6 +5087,9 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 
 	apple_radio_register(pdev, pcie);
+	if (!pcie->managed_sids && !pcie->hw->tunneled && !pcie->hw->adopt_link &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-pcie"))
+		apple_pcie_relink_probe(pcie);
 	return 0;
 }
 
@@ -5840,6 +5851,150 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 	return error;
 }
 
+/*
+ * T8132's built-in host where it runs unmanaged, as on the J604 (the radio on port 0, the SD
+ * card reader on port 2). A deep sleep's commit stops port 0 and powers the block down; the
+ * wake raises it again but leaves every port unprogrammed, and a port's DART reads nothing
+ * until its port is clocked again. So each DART waits gated (apple_dart_set_host_resumes())
+ * while every port that was up is brought up again as probe does it, with the GPIOs probe
+ * saved, its MSI and RID-to-SID routes as they were; then the DARTs are restored. The
+ * endpoints keep their power (the radio's rail is the SMC's) and the PCI core restores
+ * their configuration after this. A refusal leaves the links as they were.
+ */
+static void apple_pcie_relink_probe(struct apple_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	const __be32 *map;
+	unsigned int i, j;
+	int len, ret = 0;
+
+	map = of_get_property(dev->of_node, "iommu-map", &len);
+	len = map ? len / sizeof(*map) : 0;
+	for (i = 0; !ret && i + 4 <= len; i += 4) {
+		struct device_node *np = of_find_node_by_phandle(be32_to_cpup(map + i + 1));
+		struct platform_device *pdev = NULL;
+		u32 cells = 0;
+
+		if (np && !of_property_read_u32(np, "#iommu-cells", &cells) && cells == 1)
+			pdev = of_find_device_by_node(np);
+		of_node_put(np);
+		if (!pdev) {
+			ret = cells == 1 ? -EPROBE_DEFER : -EINVAL;
+			break;
+		}
+		for (j = 0; j < pcie->nrelink_darts; j++)
+			if (pcie->relink_dart[j] == &pdev->dev)
+				break;
+		if (j < pcie->nrelink_darts) {
+			put_device(&pdev->dev);
+			continue;
+		}
+		if (j == ARRAY_SIZE(pcie->relink_dart)) {
+			put_device(&pdev->dev);
+			ret = -E2BIG;
+			break;
+		}
+		ret = apple_dart_set_host_resumes(&pdev->dev);
+		/* The DART resumes, and gates itself, before this host. */
+		if (!ret && !device_link_add(dev, &pdev->dev, DL_FLAG_STATELESS))
+			ret = -EINVAL;
+		if (ret) {
+			put_device(&pdev->dev);
+			break;
+		}
+		/* The reference is kept: this host can't be unbound. */
+		pcie->relink_dart[pcie->nrelink_darts++] = &pdev->dev;
+	}
+	if (ret || !pcie->nrelink_darts) {
+		dev_warn(dev, "no deep sleep: its ports can't be brought up again: %d\n", ret);
+		return;
+	}
+	pcie->relink = true;
+	dev_info(dev, "deep sleep: %u ports' DARTs wait for their ports after a wake\n",
+		 pcie->nrelink_darts);
+}
+
+static void apple_pcie_relink_save(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		apple_pcie_port_disable_irq(port);
+		port->relink_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
+		if (!port->relink_up)
+			continue;
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[i] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+	}
+	pcie->relink_armed = true;
+}
+
+static int apple_pcie_relink_port(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	u32 stat;
+	int i, ret;
+
+	ret = apple_pcie_setup_link(pcie, port, port->np);
+	if (ret)
+		return ret;
+	if (!pcie->hw->retain_clocks) {
+		if (pcie->hw->port_refclk)
+			rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
+		else if (port->phy)
+			rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
+		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	}
+	apple_pcie_tunnel_restore_irq_hw(port);
+	for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+		apple_pcie_rid2sid_write(port, i, port->saved_rid2sid[i]);
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+					 stat & PORT_LINKSTS_UP, 1000,
+					 link_up_timeout * USEC_PER_MSEC);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	return 0;
+}
+
+static int apple_pcie_relink(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	unsigned int i;
+	int ret = 0, err;
+
+	pcie->relink_armed = false;
+	if (pm_resume_via_firmware()) {
+		list_for_each_entry(port, &pcie->ports, entry) {
+			if (!port->relink_up)
+				continue;
+			err = apple_pcie_relink_port(pcie, port);
+			if (err) {
+				dev_err(pcie->dev, "port %pOF not back after deep sleep: %d\n",
+					port->np, err);
+				WRITE_ONCE(port->link_failed, true);
+				ret = ret ?: err;
+			}
+		}
+		/* A DART whose port may not be clocked stays gated: nothing reaches it. */
+		for (i = 0; !ret && i < pcie->nrelink_darts; i++) {
+			err = apple_dart_host_resume(pcie->relink_dart[i]);
+			if (err)
+				ret = err;
+		}
+		if (!ret)
+			apple_sleep_radio_port_up();
+	}
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (!READ_ONCE(port->link_failed))
+			apple_pcie_port_enable_irq(port);
+	return ret;
+}
+
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -5873,6 +6028,13 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		 * Genpd would gate the host here, and an abandoned sleep then finds
 		 * it unprogrammed with nothing to bring it up. The commit lowers it.
 		 */
+		device_set_awake_path(dev);
+		return 0;
+	}
+
+	if (pcie->relink && pm_suspend_via_firmware()) {
+		apple_pcie_relink_save(pcie);
+		/* Genpd would gate the host here; the commit lowers it, and a refusal needs it. */
 		device_set_awake_path(dev);
 		return 0;
 	}
@@ -6369,6 +6531,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return apple_radio_resume_noirq(pcie);
 	if (pcie->neo_sleep_armed)
 		return apple_pcie_neo_resume_noirq(pcie);
+	if (pcie->relink_armed)
+		return apple_pcie_relink(pcie);
 	if (pcie->hw->adopt_link) {
 		if (!pcie->link_kept)
 			return 0;
