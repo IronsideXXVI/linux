@@ -1939,6 +1939,17 @@ static int dcp_m4_runtime_call_stream(struct dcp_m4_runtime *r, unsigned int met
 
 	if (method > 999)
 		return -EINVAL;
+	/*
+	 * Powered down (after a blank or for a sleep): the CPU is stopped and its
+	 * DARTs may be off, so nothing can be sent. Refuse this call alone, without
+	 * failing the session; the caller keeps its state for the power-up. Every
+	 * power-up clears gated before its own calls.
+	 */
+	if (unlikely(READ_ONCE(dcp->gated))) {
+		dev_warn_ratelimited(dcp->dev, "A%03u not sent: display coprocessor powered down\n",
+				     method);
+		return -EAGAIN;
+	}
 	/* The epoch our own call goes out in, for its nested callbacks. */
 	if (!remote) {
 		r->ext_local_calls++;
