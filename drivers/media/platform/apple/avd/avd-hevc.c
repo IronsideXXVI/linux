@@ -30,6 +30,24 @@ module_param(hevc_out_packed, bool, 0644);
 MODULE_PARM_DESC(hevc_out_packed,
 		 "Test only: decode 10-bit HEVC into the packed output mode (picture not usable); default off");
 
+/*
+ * Test switches (default 0) for the 16-bit (P010) output of 10-bit HEVC:
+ * the value of picture header word 0x58 (0 today; H.264 sends 0x3a there)
+ * and bits ORed into the picture's three dma_config words. They exist so
+ * that the output configuration macOS sends for its 16-bit 'x420' layout
+ * (743 fps on the same silicon against our 547) can be applied as soon as
+ * a capture names it. 8-bit streams are never changed.
+ */
+static unsigned int hevc_out_hdr58;
+module_param(hevc_out_hdr58, uint, 0644);
+MODULE_PARM_DESC(hevc_out_hdr58,
+		 "Test only: 10-bit HEVC picture header word 0x58 (default 0)");
+
+static unsigned int hevc_out_dma;
+module_param(hevc_out_dma, uint, 0644);
+MODULE_PARM_DESC(hevc_out_dma,
+		 "Test only: bits ORed into the 10-bit HEVC picture dma_config words (default 0)");
+
 #define NEW_TILE_ID	BIT(0)
 #define NEW_SLICE	BIT(1)
 
@@ -323,8 +341,12 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	u32 height = sps->pic_height_in_luma_samples;
 	u32 dma_config = avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER ?
 			 HEVC_DMA_CONFIG : 0;
+	bool ten_bit = sps->bit_depth_luma_minus8 == 2;
 
 	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
+
+	if (ten_bit)
+		dma_config |= READ_ONCE(hevc_out_dma);
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
 		     AVD_OP_HDR_FLAG_PACKED((READ_ONCE(hevc_out_packed) ||
@@ -339,7 +361,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	push(AVD_HDR_CODEC_MODE(AVD_CODEC_HEVC), "hdr_50_mode");
 	push(AVD_HDR_HEIGHT(height - 1) | AVD_HDR_WIDTH(width - 1),
 	     "hdr_54_height_width");
-	push(0, "hdr_58_pixfmt_zero");
+	push(ten_bit ? READ_ONCE(hevc_out_hdr58) : 0, "hdr_58_pixfmt");
 
 	push(AVD_HDR_HEIGHT((height - 1) >> 3) |
 		     AVD_HDR_WIDTH((width - 1) >> 3),
