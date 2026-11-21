@@ -20,6 +20,9 @@
 #define CS42L84_FRZ_CTL				0x0006
 #define CS42L84_FRZ_CTL_ENGAGE			BIT(0)
 
+#define CS42L84_SOFT_RESET			0x0203
+#define CS42L84_SOFT_RESET_TRIGGER		0x5a
+
 #define CS42L84_TSRS_PLUG_INT_STATUS		0x0400
 #define CS42L84_TSRS_PLUG_INT_MASK		0x0418
 #define CS42L84_RS_PLUG_SHIFT			0
@@ -75,6 +78,10 @@
 #define CS42L84_PLL_DIV_INT			0x0807
 #define CS42L84_PLL_DIVOUT			0x0808
 
+/* I2C SDA and ASP SDOUT pad slew rates */
+#define CS42L84_PAD_SLEW_CTL2			0x0c01
+#define CS42L84_PAD_SLEW_CTL2_INIT		0x0b
+
 #define CS42L84_RING_SENSE_CTL			0x1282
 #define CS42L84_RING_SENSE_CTL_INV		BIT(7)
 #define CS42L84_RING_SENSE_CTL_UNK1		BIT(6)
@@ -86,6 +93,9 @@
 #define CS42L84_TIP_SENSE_CTL_RISETIME		GENMASK(2, 0)
 
 #define CS42L84_TSRS_PLUG_STATUS		0x1288
+
+#define CS42L84_DET_WAKE_CTL			0x1471
+#define CS42L84_DET_WAKE_CTL_EN			BIT(5)
 
 #define CS42L84_TIP_SENSE_CTL2			0x1473
 #define CS42L84_TIP_SENSE_CTL2_MODE		GENMASK(7, 6)
@@ -114,6 +124,13 @@
  * there is no public register reference for CS42L84.
  */
 #define CS42L84_HS_DET_STATUS2_SHORT_TRUE	BIT(0)
+
+#define CS42L84_DET_CTL3			0x1478
+#define CS42L84_DET_CTL3_INIT			0x8f
+
+/* Detect interrupt mask; bits 5 and 6 report in REMOTE_BUTTON_STATUS1 */
+#define CS42L84_DET_INT_MASK1			0x1480
+#define CS42L84_DET_INT_MASK1_RING		0x80
 
 /*
  * Undocumented, empirically-discovered register that pulses a bit when the
@@ -165,6 +182,9 @@
 
 #define CS42L84_DAC_CTL1			0x3000
 #define CS42L84_DAC_CTL1_UNMUTE			BIT(0)
+/* Headphone output stage: load, capacitive load and high-voltage selects */
+#define CS42L84_DAC_CTL1_HP_OUT			(BIT(6) | BIT(5) | BIT(4) | BIT(2))
+#define CS42L84_DAC_CTL1_HP_OUT_INIT		BIT(5)
 //#define CS42L84_DAC_CTL1_DACB_INV_SHIFT 1
 //#define CS42L84_DAC_CTL1_DACA_INV_SHIFT 0
 #define CS42L84_DAC_CTL2			0x3001
@@ -176,6 +196,17 @@
 #define CS42L84_HP_VOL_CTL			0x3020
 #define CS42L84_HP_VOL_CTL_ZERO_CROSS		BIT(1)
 #define CS42L84_HP_VOL_CTL_SOFT			BIT(0)
+
+/* Sample-rate block setup, the same for every rate */
+#define CS42L84_SR_TRIM				0x3065
+#define CS42L84_SR_TRIM_COMMON			GENMASK(2, 1)
+#define CS42L84_SR_CFG_C			0x31ae
+#define CS42L84_SR_CFG_C_INIT			0xab
+/* 16-bit little-endian pairs: two at 0x31e8 and four at 0x31b0, 12 apart */
+#define CS42L84_SR_CFG_A(n)			(0x31e8 + 12 * (n))
+#define CS42L84_SR_CFG_A_INIT			0x0277
+#define CS42L84_SR_CFG_B(n)			(0x31b0 + 12 * (n))
+#define CS42L84_SR_CFG_B_INIT			0x05e6
 
 #define CS42L84_SRC_ASP_RX_CH1			0b1101
 #define CS42L84_SRC_ASP_RX_CH2			0b1110
