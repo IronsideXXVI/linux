@@ -630,3 +630,12 @@
 	min-duty-cycle-bp = <542>;
 	max-duty-cycle-bp = <3500>;
 };
+
+/*
+ * The headset jack reports the plug on ring sense, as macOS's device tree
+ * has it (enable-ringsense); tip sense keeps re-asserting with nothing
+ * plugged in.
+ */
+&jack_codec {
+	cirrus,ring-sense-detect;
+};
