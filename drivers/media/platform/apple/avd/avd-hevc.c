@@ -18,6 +18,18 @@
 #include "avd.h"
 #include "avd-inst.h"
 
+/*
+ * Test switch (default off): write 10-bit HEVC pictures in the AVD's packed
+ * output mode (three 10-bit samples in 32 bits, macOS's default 'p420'
+ * layout) instead of 16-bit samples. The CAPTURE format stays P010, so the
+ * picture is not usable by a client; it exists to time the decoder in that
+ * mode against the default on the same stream.
+ */
+static bool hevc_out_packed;
+module_param(hevc_out_packed, bool, 0644);
+MODULE_PARM_DESC(hevc_out_packed,
+		 "Test only: decode 10-bit HEVC into the packed output mode (picture not usable); default off");
+
 #define NEW_TILE_ID	BIT(0)
 #define NEW_SLICE	BIT(1)
 
@@ -315,8 +327,9 @@ static void set_header(struct avd_ctx *ctx, struct avd_hevc_run *run)
 	bool is_intra = run->sl[0].slice_type == V4L2_HEVC_SLICE_TYPE_I;
 
 	push(AVD_OP_HDR | AVD_OP_HDR_FLAG_DECOMP(ctx->decomp) |
-		     AVD_OP_HDR_FLAG_PACKED(ctx->decoded_fmt.fmt.pix_mp.pixelformat ==
-					    V4L2_PIX_FMT_P030 &&
+		     AVD_OP_HDR_FLAG_PACKED((READ_ONCE(hevc_out_packed) ||
+					     ctx->decoded_fmt.fmt.pix_mp.pixelformat ==
+					     V4L2_PIX_FMT_P030) &&
 					    sps->bit_depth_luma_minus8 == 2) |
 		     AVD_OP_HDR_FLAG_INTRA(is_intra) | AVD_OP_HDR_CONST |
 		     AVD_OP_HDR_FLAG_PIPE_STATE(
