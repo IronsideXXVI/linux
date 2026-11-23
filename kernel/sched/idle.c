@@ -499,6 +499,13 @@ static void set_next_task_idle(struct rq *rq, struct task_struct *next, bool fir
 	 * lost_idle_time of clock_pelt
 	 */
 	update_idle_rq_clock_pelt(rq);
+
+	/*
+	 * The task that ran has left the runqueue, so its uclamp.min no
+	 * longer counts. Let the governor drop the request it raised.
+	 */
+	if (first)
+		cpufreq_update_util(rq, SCHED_CPUFREQ_IDLE);
 }
 
 struct task_struct *pick_task_idle(struct rq *rq, struct rq_flags *rf)

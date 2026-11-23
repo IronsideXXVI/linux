@@ -13,6 +13,7 @@
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
 	unsigned int		rate_limit_us;
+	bool			idle_update;
 };
 
 struct sugov_policy {
@@ -37,6 +38,7 @@ struct sugov_policy {
 
 	bool			limits_changed;
 	bool			need_freq_update;
+	bool			idle_update;
 };
 
 struct sugov_cpu {
@@ -543,12 +545,27 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned int next_f;
 
+	bool idle;
+
 	raw_spin_lock(&sg_policy->update_lock);
 
 	sugov_iowait_boost(sg_cpu, time, flags);
 	sg_cpu->last_update = time;
 
 	ignore_dl_rate_limit(sg_cpu);
+
+	/*
+	 * idle_update: a CPU going idle re-evaluates the policy past the rate
+	 * limit. A short task that raised the policy (a uclamp.min floor asks
+	 * for the top state) has usually gone within rate_limit_us, so its
+	 * dequeue update is skipped, and with no tick nothing updates an idle
+	 * policy: the cluster idles at the state the task asked for until the
+	 * next wakeup. The next update is not rate limited either, so a task
+	 * waking just after the drop gets its frequency at once.
+	 */
+	idle = (flags & SCHED_CPUFREQ_IDLE) && READ_ONCE(sg_policy->idle_update);
+	if (idle)
+		sg_policy->need_freq_update = true;
 
 	if (sugov_should_update_freq(sg_policy, time)) {
 		next_f = sugov_next_freq_shared(sg_cpu, time);
@@ -562,6 +579,8 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 			sugov_deferred_update(sg_policy);
 	}
 unlock:
+	if (idle)
+		sg_policy->need_freq_update = true;
 	raw_spin_unlock(&sg_policy->update_lock);
 }
 
@@ -637,8 +656,36 @@ rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count
 
 static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
 
+static ssize_t idle_update_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+
+	return sysfs_emit(buf, "%u\n", tunables->idle_update);
+}
+
+static ssize_t
+idle_update_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	struct sugov_policy *sg_policy;
+	bool idle_update;
+
+	if (kstrtobool(buf, &idle_update))
+		return -EINVAL;
+
+	tunables->idle_update = idle_update;
+
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
+		WRITE_ONCE(sg_policy->idle_update, idle_update);
+
+	return count;
+}
+
+static struct governor_attr idle_update = __ATTR_RW(idle_update);
+
 static struct attribute *sugov_attrs[] = {
 	&rate_limit_us.attr,
+	&idle_update.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(sugov);
@@ -806,6 +853,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 	}
 
 	tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);
+	tunables->idle_update = true;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
@@ -873,6 +921,7 @@ static int sugov_start(struct cpufreq_policy *policy)
 	unsigned int cpu;
 
 	sugov_update_rate_limit_us(sg_policy);
+	WRITE_ONCE(sg_policy->idle_update, sg_policy->tunables->idle_update);
 	sg_policy->last_freq_update_time	= 0;
 	sg_policy->next_freq			= 0;
 	sg_policy->work_in_progress		= false;
